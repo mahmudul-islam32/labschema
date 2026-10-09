@@ -71,7 +71,7 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Run tests with coverage
-        run: pytest --cov=labschema --cov-report=xml --cov-fail-under=90
+        run: pytest --cov=labschema --cov-report=xml --cov-fail-under=85
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4

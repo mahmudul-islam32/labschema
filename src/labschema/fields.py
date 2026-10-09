@@ -19,6 +19,26 @@ _VALID_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ALLOWED_DTYPES = (int, float, str, bool)
 
 
+class _UnsetType:
+    """Sentinel for unset default values."""
+
+    _instance: _UnsetType | None = None
+
+    def __new__(cls) -> _UnsetType:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "<UNSET>"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+_UNSET: _UnsetType = _UnsetType()
+
+
 def _validate_name(name: str) -> None:
     """Validate that a field name is a valid Python identifier-like string."""
     if not _VALID_NAME_PATTERN.match(name):
@@ -248,23 +268,3 @@ class Field:
             )
 
         return cls(**kwargs)
-
-
-class _UnsetType:
-    """Sentinel for unset default values."""
-
-    _instance: _UnsetType | None = None
-
-    def __new__(cls) -> _UnsetType:
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __repr__(self) -> str:
-        return "<UNSET>"
-
-    def __bool__(self) -> bool:
-        return False
-
-
-_UNSET = _UnsetType()

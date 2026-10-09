@@ -1,11 +1,14 @@
 """Tests for the CLI module."""
 
+import argparse
 import json
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from labschema.cli import cmd_export_schema, cmd_infer, cmd_validate, main
 
 
 @pytest.fixture
@@ -265,3 +268,163 @@ class TestCliVersion:
         assert result.returncode == 0
         assert "labschema" in result.stdout
         assert "0.1.0" in result.stdout
+
+
+class TestCliDirectCalls:
+    """Tests for direct CLI function calls."""
+
+    def test_cmd_validate_strict_mode(self, tmp_path: Path) -> None:
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("name,extra\nAlice,x")
+        schema_file = tmp_path / "schema.json"
+        schema_file.write_text(
+            json.dumps(
+                {
+                    "labschema": "0.1",
+                    "name": "test",
+                    "fields": [{"name": "name", "dtype": "str"}],
+                    "extra_columns": "warn",
+                }
+            )
+        )
+
+        args = argparse.Namespace(
+            data=str(csv_file),
+            schema=str(schema_file),
+            delimiter=None,
+            decimal=".",
+            thousands=None,
+            encoding="utf-8-sig",
+            skip_rows=0,
+            comment=None,
+            na=[],
+            max_errors=1000,
+            format="text",
+            strict=True,
+            quiet=False,
+        )
+        exit_code = cmd_validate(args)
+        assert exit_code == 1  # Warnings treated as errors
+
+    def test_cmd_infer_read_error(self) -> None:
+        args = argparse.Namespace(
+            data="nonexistent_file.csv",
+            sample_rows=100,
+            name=None,
+            format="json",
+            output=None,
+        )
+        exit_code = cmd_infer(args)
+        assert exit_code == 2
+
+    def test_cmd_export_schema_output_file(self, tmp_path: Path) -> None:
+        schema_file = tmp_path / "schema.json"
+        schema_file.write_text(
+            json.dumps(
+                {
+                    "labschema": "0.1",
+                    "name": "test",
+                    "fields": [{"name": "a", "dtype": "str"}],
+                }
+            )
+        )
+        output_file = tmp_path / "output.json"
+
+        args = argparse.Namespace(
+            schema=str(schema_file),
+            format="jsonschema",
+            output=str(output_file),
+        )
+        exit_code = cmd_export_schema(args)
+        assert exit_code == 0
+        assert output_file.exists()
+
+    def test_main_labschema_error(self, tmp_path: Path) -> None:
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("a\n1")
+        with pytest.raises(SystemExit) as exc_info:
+            main(["validate", str(csv_file), "--schema", "nonexistent.json"])
+        assert exc_info.value.code == 2
+
+    def test_load_schema_from_module(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Create a test module
+        module_dir = tmp_path / "test_module"
+        module_dir.mkdir()
+        (module_dir / "__init__.py").write_text("")
+        (module_dir / "schemas.py").write_text("""
+from labschema import TableSchema, Field
+test_schema = TableSchema(name="test", fields=[Field("a", str)])
+""")
+        monkeypatch.syspath_prepend(str(tmp_path))
+
+        from labschema.cli import _load_schema
+
+        schema = _load_schema("test_module.schemas:test_schema")
+        assert schema.name == "test"
+
+    def test_validate_with_options(self, tmp_path: Path) -> None:
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("# comment\na;b\n1;2")
+        schema_file = tmp_path / "schema.json"
+        schema_file.write_text(
+            json.dumps(
+                {
+                    "labschema": "0.1",
+                    "name": "test",
+                    "fields": [
+                        {"name": "a", "dtype": "int"},
+                        {"name": "b", "dtype": "int"},
+                    ],
+                }
+            )
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "labschema",
+                "validate",
+                str(csv_file),
+                "--schema",
+                str(schema_file),
+                "--delimiter",
+                ";",
+                "--skip-rows",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+
+    def test_export_schema_output_file_labschema(self, tmp_path: Path) -> None:
+        schema_file = tmp_path / "schema.json"
+        schema_file.write_text(
+            json.dumps(
+                {
+                    "labschema": "0.1",
+                    "name": "test",
+                    "fields": [{"name": "a", "dtype": "str"}],
+                }
+            )
+        )
+        output_file = tmp_path / "output.json"
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "labschema",
+                "export-schema",
+                str(schema_file),
+                "--format",
+                "labschema",
+                "-o",
+                str(output_file),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert output_file.exists()

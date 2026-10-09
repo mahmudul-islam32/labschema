@@ -1,5 +1,7 @@
 """Tests for the validation module."""
 
+import pytest
+
 from labschema.errors import ErrorCode
 from labschema.fields import Field
 from labschema.schema import TableSchema
@@ -250,3 +252,53 @@ class TestValidateRows:
         result = validate_rows(rows, schema, max_errors=5)
         assert len(result.errors) <= 5
         assert result.report.truncated
+
+    def test_gt_constraint(self) -> None:
+        schema = TableSchema(
+            name="test",
+            fields=[Field("a", float, gt=0)],
+        )
+        rows = [{"a": "0"}]
+        result = validate_rows(rows, schema)
+        assert not result.ok
+        assert result.errors[0].code == ErrorCode.LESS_THAN_MINIMUM
+
+    def test_lt_constraint(self) -> None:
+        schema = TableSchema(
+            name="test",
+            fields=[Field("a", float, lt=100)],
+        )
+        rows = [{"a": "100"}]
+        result = validate_rows(rows, schema)
+        assert not result.ok
+        assert result.errors[0].code == ErrorCode.GREATER_THAN_MAXIMUM
+
+    def test_float_coercion(self) -> None:
+        schema = TableSchema(
+            name="test",
+            fields=[Field("a", float)],
+        )
+        rows = [{"a": "1.5e-3"}, {"a": "inf"}]
+        result = validate_rows(rows, schema)
+        assert result.ok
+        assert result.records[0]["a"] == pytest.approx(0.0015)
+
+    def test_int_from_float_string(self) -> None:
+        schema = TableSchema(
+            name="test",
+            fields=[Field("a", int)],
+        )
+        rows = [{"a": "3.0"}]
+        result = validate_rows(rows, schema)
+        assert result.ok
+        assert result.records[0]["a"] == 3
+
+    def test_int_from_non_integral_float_fails(self) -> None:
+        schema = TableSchema(
+            name="test",
+            fields=[Field("a", int)],
+        )
+        rows = [{"a": "3.5"}]
+        result = validate_rows(rows, schema)
+        assert not result.ok
+        assert result.errors[0].code == ErrorCode.TYPE_ERROR

@@ -76,11 +76,11 @@ def read_csv(
             content = path.read_text(encoding=encoding)
         except OSError as e:
             raise ReadError(f"Cannot read file: {e}") from e
-        file_obj = io.StringIO(content)
+        text_content = content
     else:
-        file_obj = source
+        text_content = source.read()
 
-    lines = file_obj.read().splitlines(keepends=False)
+    lines = text_content.splitlines(keepends=False)
 
     for _ in range(skip_rows):
         if lines:

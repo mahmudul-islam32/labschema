@@ -363,8 +363,8 @@ class _Validator:
         row_has_error = False
 
         for f in self.schema.fields:
-            header = None
-            raw_value = None
+            header: str | None = None
+            raw_value: str = ""
             for h in headers:
                 if h in self._header_to_field and self._header_to_field[h].name == f.name:
                     header = h

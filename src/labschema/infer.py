@@ -177,18 +177,17 @@ def infer_schema(
         path = Path(source)
         source_name = str(source)
         try:
-            content = path.read_text(encoding=encoding)
+            text_content = path.read_text(encoding=encoding)
         except OSError as e:
             raise ReadError(f"Cannot read file: {e}") from e
-        file_obj = io.StringIO(content)
         if name is None:
             name = normalize_name(path.stem) or "inferred_schema"
     else:
-        file_obj = source
+        text_content = source.read()
         if name is None:
             name = "inferred_schema"
 
-    lines = file_obj.read().splitlines(keepends=False)
+    lines = text_content.splitlines(keepends=False)
 
     for _ in range(skip_rows):
         if lines:
@@ -252,6 +251,7 @@ def infer_schema(
         values = column_values.get(i, [])
         has_missing = column_missing.get(i, 0) > 0
 
+        dtype: type
         if not values:
             dtype = str
             nullable = True

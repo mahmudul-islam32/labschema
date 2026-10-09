@@ -255,10 +255,12 @@ class TableSchema:
 
         for f in self.fields:
             if f.unit is not None:
-                from labschema.units import parse_unit
+                from labschema.units import get_registry, parse_unit
 
+                reg = get_registry()
                 unit = parse_unit(f.unit if isinstance(f.unit, str) else str(f.unit))
-                base_unit = unit.to_base_units().units
+                quantity = reg.Quantity(1, unit)
+                base_unit = quantity.to_base_units().units
                 new_fields.append(
                     Field(
                         name=f.name,
