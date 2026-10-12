@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-import csv
-import io
 import os
+import re
 from collections.abc import Collection
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TextIO
+from typing import Any, Literal, TextIO
 
 from labschema.errors import ReadError
 from labschema.fields import Field
+from labschema.io.csv import _ParseFailure, open_table
 from labschema.schema import TableSchema, normalize_name
-from labschema.units import parse_header_unit
+from labschema.units import canonical_header_unit, parse_header_unit
 from labschema.validate import DEFAULT_NA_VALUES
 
-if TYPE_CHECKING:
-    pass
+_FIELD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _get_version() -> str:
@@ -26,13 +25,21 @@ def _get_version() -> str:
     return __version__
 
 
-def _detect_delimiter(sample: str) -> str:
-    """Detect the delimiter from a sample of the file."""
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-        return dialect.delimiter
-    except csv.Error:
-        return ","
+def _safe_field_name(name: str, index: int, used: set[str]) -> str:
+    """Return a unique identifier-like field name."""
+    candidate = name or f"column_{index}"
+    if not _FIELD_NAME.match(candidate):
+        cleaned = re.sub(r"[^A-Za-z0-9_]", "_", candidate).strip("_")
+        candidate = f"col_{cleaned}" if cleaned else f"column_{index}"
+        if not _FIELD_NAME.match(candidate):
+            candidate = f"column_{index}"
+    base = candidate
+    suffix = 2
+    while candidate in used:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
 
 
 def _try_parse_bool(value: str) -> bool | None:
@@ -176,77 +183,54 @@ def infer_schema(
     if isinstance(source, (str, os.PathLike)):
         path = Path(source)
         source_name = str(source)
-        try:
-            text_content = path.read_text(encoding=encoding)
-        except OSError as e:
-            raise ReadError(f"Cannot read file: {e}") from e
         if name is None:
             name = normalize_name(path.stem) or "inferred_schema"
+        table_source: str | os.PathLike[str] | TextIO = path
     else:
-        text_content = source.read()
         if name is None:
             name = "inferred_schema"
+        table_source = source
 
-    lines = text_content.splitlines(keepends=False)
-
-    for _ in range(skip_rows):
-        if lines:
-            lines.pop(0)
-
-    if comment:
-        lines = [line for line in lines if not line.startswith(comment)]
-
-    if not lines:
-        raise ReadError("File is empty or contains no data rows")
-
-    if delimiter is None:
-        sample = "\n".join(lines[: min(10, len(lines))])
-        delimiter = _detect_delimiter(sample)
-
-    content = "\n".join(lines)
+    column_values: dict[int, list[str]] = {}
+    column_missing: dict[int, int] = {}
+    sampled = 0
 
     try:
-        reader = csv.reader(io.StringIO(content), delimiter=delimiter)
-        rows = list(reader)
-    except csv.Error as e:
-        raise ReadError(f"Malformed CSV: {e}") from e
-
-    if not rows:
-        raise ReadError("File is empty or contains no data rows")
-
-    headers = rows[0]
-    if strip:
-        headers = [h.strip() for h in headers]
-
-    data_rows = rows[1 : 1 + sample_rows]
-
-    column_values: dict[int, list[str]] = {i: [] for i in range(len(headers))}
-    column_missing: dict[int, int] = dict.fromkeys(range(len(headers)), 0)
-
-    for row in data_rows:
-        if strip:
-            row = [cell.strip() for cell in row]
-
-        for i, cell in enumerate(row):
-            if i >= len(headers):
-                continue
-
-            if thousands and i < len(headers):
-                cell = cell.replace(thousands, "")
-
-            if cell in all_na_values:
-                column_missing[i] += 1
-            else:
-                column_values[i].append(cell)
+        with open_table(
+            table_source,
+            delimiter=delimiter,
+            encoding=encoding,
+            skip_rows=skip_rows,
+            comment=comment,
+            strip=strip,
+        ) as (headers, table_rows):
+            column_values = {i: [] for i in range(len(headers))}
+            column_missing = dict.fromkeys(range(len(headers)), 0)
+            for _line, row in table_rows:
+                if sampled >= sample_rows:
+                    break
+                sampled += 1
+                for i, cell in enumerate(row):
+                    if i >= len(headers):
+                        continue
+                    if thousands:
+                        cell = cell.replace(thousands, "")
+                    if cell in all_na_values:
+                        column_missing[i] += 1
+                    else:
+                        column_values[i].append(cell)
+    except _ParseFailure as exc:
+        raise ReadError(f"Malformed CSV: {exc.message}") from exc
 
     fields: list[Field] = []
+    used_names: set[str] = set()
+    used_norms: set[str] = set()
 
     for i, header in enumerate(headers):
-        col_name, unit_str, _ = parse_header_unit(header)
-        field_name = normalize_name(col_name)
-
-        if not field_name:
-            field_name = f"column_{i + 1}"
+        col_name, unit_str, _ambiguous = parse_header_unit(header)
+        normalized = normalize_name(col_name)
+        field_name = _safe_field_name(normalized, i + 1, used_names)
+        used_norms.add(normalize_name(field_name))
 
         values = column_values.get(i, [])
         has_missing = column_missing.get(i, 0) > 0
@@ -259,7 +243,14 @@ def infer_schema(
             dtype, _ = _infer_dtype(values, decimal)
             nullable = has_missing
 
-        alias = header if header != col_name and header != field_name else None
+        canonical_unit = canonical_header_unit(unit_str) if unit_str else None
+
+        alias: str | None = None
+        if header != field_name:
+            alias_norm = normalize_name(header)
+            if alias_norm and alias_norm not in used_norms:
+                alias = header
+                used_norms.add(alias_norm)
 
         description_parts: list[str] = []
         observed_range = _format_observed_range(values, dtype)
@@ -280,8 +271,8 @@ def infer_schema(
             "nullable": nullable,
         }
 
-        if unit_str and dtype in (int, float):
-            field_kwargs["unit"] = unit_str
+        if canonical_unit and dtype in (int, float):
+            field_kwargs["unit"] = canonical_unit
 
         if description:
             field_kwargs["description"] = description
@@ -293,7 +284,7 @@ def infer_schema(
 
     metadata: dict[str, Any] = {
         "inferred": {
-            "sample_rows": len(data_rows),
+            "sample_rows": sampled,
             "labschema_version": _get_version(),
         }
     }

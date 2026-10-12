@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import pint
 
@@ -11,50 +11,78 @@ if TYPE_CHECKING:
     from pint import Unit
 
 _registry: pint.UnitRegistry | None = None
+_locked = False
+
+_ALIAS_DEFINITIONS = (
+    "percent = 0.01 * dimensionless = %",
+    "@alias revolution = rev",
+    "revolutions_per_minute = revolution / minute = rpm",
+    "molar = mol / liter = M",
+    "arbitrary_unit = dimensionless = AU = au = a_u = RFU = OD",
+)
+
+
+def _install_aliases(reg: pint.UnitRegistry) -> None:
+    """Add lab unit aliases to a registry, ignoring ones already defined."""
+    for definition in _ALIAS_DEFINITIONS:
+        try:
+            reg.define(definition)
+        except (pint.errors.RedefinitionError, pint.errors.DefinitionSyntaxError):
+            continue
 
 
 def _create_registry() -> pint.UnitRegistry:
     """Create and configure the LabSchema pint registry with lab aliases."""
     reg = pint.UnitRegistry()
-
-    reg.define("percent = 0.01 * dimensionless = %")
-    reg.define("@alias revolution = rev")
-    reg.define("revolutions_per_minute = revolution / minute = rpm")
-    reg.define("molar = mol / liter = M")
-    reg.define("arbitrary_unit = dimensionless = AU = au = a_u = RFU = OD")
-
+    _install_aliases(reg)
     return reg
 
 
 def get_registry() -> pint.UnitRegistry:
     """Get the shared LabSchema pint registry."""
-    global _registry
+    global _registry, _locked
     if _registry is None:
         _registry = _create_registry()
+    _locked = True
     return _registry
 
 
 def set_registry(registry: pint.UnitRegistry) -> None:
     """Set a custom pint registry for LabSchema to use.
 
+    Call this before any other LabSchema operation. Mixing units from two
+    registries raises ``SchemaError``.
+
     Args:
         registry: A pint.UnitRegistry to use for all unit operations.
 
     Raises:
-        SchemaError: If the registry is incompatible or already set to a different registry.
+        SchemaError: If a different registry is already in use.
     """
-    global _registry
-    if _registry is not None and _registry is not registry:
+    global _registry, _locked
+    if _locked and _registry is not None and _registry is not registry:
         from labschema.errors import SchemaError
 
         raise SchemaError(
             "Cannot change registry after it has been used. "
             "Call set_registry() before any other labschema operations."
         )
+    _install_aliases(registry)
     _registry = registry
+    _locked = True
 
 
-u = get_registry()
+class _RegistryProxy:
+    """Defer registry creation so ``set_registry`` can run before first use."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(get_registry(), name)
+
+    def __repr__(self) -> str:
+        return repr(get_registry())
+
+
+u = cast(pint.UnitRegistry, _RegistryProxy())
 
 
 _HEADER_UNIT_PATTERN = re.compile(r"^(?P<name>.*?)\s*[\[(](?P<unit>[^\[\]()]+)[\])]\s*$")
@@ -98,7 +126,45 @@ def parse_header_unit(header: str) -> tuple[str, str | None, bool]:
     if parsed_unit is not None:
         return name, unit_text, is_ambiguous
 
+    if _looks_like_unit(unit_text):
+        return name, unit_text, False
+
     return header, None, False
+
+
+def _looks_like_unit(text: str) -> bool:
+    """Return True when bracket text looks like a unit but may be unknown.
+
+    Plain words (``replicate``, ``sample``) are names. Expressions with
+    ``/``, ``*``, ``^``, or ``·``, and texts containing ``°`` or ``%``,
+    look like units.
+    """
+    if re.fullmatch(r"[A-Za-z]+", text):
+        return False
+    if any(operator in text for operator in "/^*·"):
+        return True
+    return "°" in text or "%" in text
+
+
+def canonical_header_unit(unit_text: str) -> str | None:
+    """Return a registry unit string for header text, or None if it will not parse.
+
+    Header-only aliases such as ``C`` for degrees Celsius are honored.
+    """
+    parsed, _ambiguous = _try_parse_unit(unit_text, from_header=True)
+    return parsed
+
+
+def format_unit(unit_str: str | None) -> str:
+    """Return a compact display string for a unit, such as ``°C`` or ``mg/l``."""
+    if not unit_str:
+        return ""
+    try:
+        unit = parse_unit(unit_str)
+    except Exception:
+        return unit_str
+    pretty = f"{unit:~P}".strip()
+    return pretty or str(unit)
 
 
 def _try_parse_unit(unit_text: str, from_header: bool = False) -> tuple[str | None, bool]:

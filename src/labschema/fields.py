@@ -9,7 +9,7 @@ from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, Any
 
 from labschema.errors import SchemaError
-from labschema.units import get_unit_string, parse_unit
+from labschema.units import get_registry, get_unit_string, parse_unit
 
 if TYPE_CHECKING:
     from pint import Unit
@@ -95,6 +95,15 @@ class Field:
             raise SchemaError(
                 f"Field {self.name!r}: unit is only allowed for numeric types (int, float)"
             )
+
+        if self.unit is not None and not isinstance(self.unit, str):
+            unit_registry = getattr(self.unit, "_REGISTRY", None)
+            if unit_registry is not None and unit_registry is not get_registry():
+                raise SchemaError(
+                    f"Field {self.name!r}: unit belongs to a different pint registry. "
+                    "Call labschema.units.set_registry() before creating units, "
+                    "or pass the unit as a string."
+                )
 
         if self.unit is not None:
             try:

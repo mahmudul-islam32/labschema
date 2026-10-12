@@ -44,6 +44,7 @@ class ValidationIssue:
         row: 1-based file line number (header is line 1). None for file-level issues.
         column: Raw header text as it appears in the file. None for row-level issues.
         field_name: Schema field name. None if the issue isn't field-specific.
+            ``field`` is the public alias of this attribute.
         value: Raw cell text (truncated to 80 chars). None if not applicable.
         context: Code-specific details (e.g., {'ge': 0, 'unit': 'mg/L'}).
     """
@@ -56,6 +57,11 @@ class ValidationIssue:
     field_name: str | None = None
     value: str | None = None
     context: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def field(self) -> str | None:
+        """Schema field name. Public alias of ``field_name``."""
+        return self.field_name
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the issue to a dictionary for JSON serialization."""
