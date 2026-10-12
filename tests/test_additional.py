@@ -39,7 +39,7 @@ class TestValidationReportPrintSummary:
         report.print_summary(file=output, limit=1)
         content = output.getvalue()
         assert "type_error" in content
-        assert "... and 1 more" in content
+        assert "… and 1 more" in content
 
     def test_print_summary_truncated(self) -> None:
         report = ValidationReport()
