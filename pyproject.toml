@@ -46,10 +46,10 @@ dev = [
 labschema = "labschema.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/labschema/labschema"
-Documentation = "https://github.com/labschema/labschema#readme"
-Repository = "https://github.com/labschema/labschema"
-Issues = "https://github.com/labschema/labschema/issues"
+Homepage = "https://github.com/mahmudul-islam32/labschema"
+Documentation = "https://github.com/mahmudul-islam32/labschema/blob/main/docs/SPEC.md"
+Repository = "https://github.com/mahmudul-islam32/labschema"
+Issues = "https://github.com/mahmudul-islam32/labschema/issues"
 
 [tool.hatch.version]
 path = "src/labschema/__init__.py"

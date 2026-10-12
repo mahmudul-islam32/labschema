@@ -6,7 +6,7 @@ Thank you for your interest in contributing to LabSchema! This document provides
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/labschema/labschema.git
+git clone https://github.com/mahmudul-islam32/labschema.git
 cd labschema
 ```
 
@@ -129,12 +129,12 @@ When reporting bugs, please include:
 
 ## Good First Issues
 
-Look for issues labeled `good first issue` if you're new to the project. These are typically:
+Look for issues labeled `good first issue` if you're new to the project. Starter tasks:
 
-- Adding new unit aliases
-- Improving error messages
-- Adding test cases
-- Documentation improvements
+- Add a lab unit alias (for example another spelling of an existing Pint unit)
+- Teach header inference an extra pattern, such as a trailing unit without brackets
+- Add a fixture and expected report for a new error code
+- Improve an error message while keeping the snapshot stable
 
 ## Questions?
 

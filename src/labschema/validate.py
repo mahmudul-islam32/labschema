@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import numbers
 import re
 import sys
 from collections import defaultdict
@@ -10,9 +12,17 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TextIO
 
+from pydantic import ConfigDict, TypeAdapter, ValidationError, create_model
+
 from labschema.errors import ErrorCode, ValidationIssue
 from labschema.fields import Field
-from labschema.units import are_units_compatible, convert_value, parse_header_unit
+from labschema.units import (
+    are_units_compatible,
+    canonical_header_unit,
+    convert_value,
+    format_unit,
+    parse_header_unit,
+)
 
 if TYPE_CHECKING:
     from labschema.schema import TableSchema
@@ -40,6 +50,42 @@ DEFAULT_NA_VALUES = frozenset(
 
 _BOOL_TRUE = frozenset({"true", "yes", "y", "1", "t"})
 _BOOL_FALSE = frozenset({"false", "no", "n", "0", "f"})
+_INT_LITERAL = re.compile(r"[+-]?\d+")
+
+
+def _q(text: str) -> str:
+    """Quote text the way validation messages do."""
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _format_number(value: Any) -> str:
+    """Format a bound or converted value without a trailing ``.0``."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _build_row_adapter(schema: TableSchema) -> TypeAdapter[Any]:
+    """Build one strict TypeAdapter for a schema and reuse it for every row.
+
+    Locale decimals, sentinels, and unit conversion happen before this adapter
+    sees a value, so it runs in strict mode.
+    """
+    definitions: dict[str, Any] = {}
+    for column in schema.fields:
+        annotation: Any = column.dtype
+        if column.nullable:
+            annotation = annotation | None
+        definitions[column.name] = (annotation, ...)
+    model = create_model(
+        "LabSchemaRow",
+        __config__=ConfigDict(strict=True, extra="forbid", protected_namespaces=()),
+        **definitions,
+    )
+    return TypeAdapter(model)
 
 
 @dataclass
@@ -95,7 +141,7 @@ class ValidationReport:
                 print(f"    {issue.message}", file=file)
 
             if len(issues) > limit:
-                print(f"    ... and {len(issues) - limit} more", file=file)
+                print(f"    … and {len(issues) - limit} more", file=file)
 
         if self.truncated:
             print("\n  (report truncated due to max_errors limit)", file=file)
@@ -150,7 +196,8 @@ class ValidationResult:
         """Convert valid records to a pandas DataFrame.
 
         Returns:
-            A pandas DataFrame with correct dtypes.
+            A pandas DataFrame with correct dtypes. Units are stored in
+            ``df.attrs["labschema"]``.
 
         Raises:
             ImportError: If pandas is not installed.
@@ -164,6 +211,21 @@ class ValidationResult:
             ) from e
 
         df = pd.DataFrame(self.records)
+        for column in df.columns:
+            series = df[column]
+            non_null = series.dropna()
+            if non_null.empty:
+                continue
+            sample = non_null.iloc[0]
+            kind = str(series.dtype)
+            if isinstance(sample, bool) or kind in {"bool", "boolean"}:
+                df[column] = series.astype("boolean")
+            elif isinstance(sample, numbers.Integral) or kind.startswith(("int", "Int", "uint")):
+                df[column] = series.astype("Int64")
+            elif isinstance(sample, numbers.Real) or kind.startswith("float"):
+                df[column] = series.astype("float64")
+            elif isinstance(sample, str) or kind in {"object", "string"}:
+                df[column] = series.astype("string")
 
         df.attrs["labschema"] = {
             "column_units": self.column_units,
@@ -184,12 +246,14 @@ class _Validator:
         max_errors: int | None,
         decimal: str = ".",
         thousands: str | None = None,
+        strip: bool = True,
     ) -> None:
         self.schema = schema
         self.na_values = na_values
         self.max_errors = max_errors
         self.decimal = decimal
         self.thousands = thousands
+        self.strip = strip
 
         self.report = ValidationReport()
         self.records: list[dict[str, Any]] = []
@@ -199,9 +263,13 @@ class _Validator:
 
         self._header_to_field: dict[str, Field] = {}
         self._header_unit: dict[str, str | None] = {}
+        self._header_canonical: dict[str, str | None] = {}
         self._header_ambiguous: dict[str, bool] = {}
+        self._field_header: dict[str, str] = {}
+        self._skipped_fields: set[str] = set()
         self._seen_primary_keys: dict[tuple[Any, ...], int] = {}
         self._error_count = 0
+        self._adapter = _build_row_adapter(schema)
 
     def _add_issue(self, issue: ValidationIssue) -> bool:
         """Add an issue and return True if we should continue."""
@@ -213,6 +281,16 @@ class _Validator:
                 return False
         return True
 
+    def add_parse_error(self, message: str) -> bool:
+        """Record a malformed-CSV error."""
+        return self._add_issue(
+            ValidationIssue(
+                code=ErrorCode.PARSE_ERROR,
+                severity="error",
+                message=f"Malformed CSV: {message}",
+            )
+        )
+
     def validate_headers(self, headers: list[str]) -> bool:
         """Validate and map column headers.
 
@@ -223,38 +301,44 @@ class _Validator:
 
         for header in headers:
             name, unit_str, is_ambiguous = parse_header_unit(header)
-            f = self.schema.match_header(name)
+            column = self.schema.match_header(name)
 
-            if f is not None:
-                matched_fields[f.name].append(header)
-                self._header_to_field[header] = f
+            if column is not None:
+                matched_fields[column.name].append(header)
+                self._header_to_field[header] = column
                 self._header_unit[header] = unit_str
                 self._header_ambiguous[header] = is_ambiguous
+                self._field_header[column.name] = header
+                canonical = canonical_header_unit(unit_str) if unit_str else None
+                self._header_canonical[header] = canonical
 
                 if unit_str:
-                    self.column_units[f.name] = unit_str
+                    self.column_units[column.name] = unit_str
 
         for field_name, matching_headers in matched_fields.items():
             if len(matching_headers) > 1:
+                quoted = ", ".join(_q(item) for item in matching_headers)
                 if not self._add_issue(
                     ValidationIssue(
                         code=ErrorCode.DUPLICATE_COLUMN,
                         severity="error",
-                        message=f"Multiple columns map to field {field_name!r}: {matching_headers}",
+                        message=f"columns {quoted} both map to field {_q(field_name)}",
                         field_name=field_name,
                     )
                 ):
                     return False
 
-        for f in self.schema.fields:
-            if f.name not in matched_fields:
-                if f.nullable or f.has_default:
+        for column in self.schema.fields:
+            if column.name not in matched_fields:
+                if column.nullable or column.has_default:
                     if not self._add_issue(
                         ValidationIssue(
                             code=ErrorCode.MISSING_COLUMN,
                             severity="warning",
-                            message=f"Missing column for field {f.name!r} (will use null/default)",
-                            field_name=f.name,
+                            message=(
+                                f"missing column for field {_q(column.name)} (using null or default)"
+                            ),
+                            field_name=column.name,
                         )
                     ):
                         return False
@@ -263,8 +347,8 @@ class _Validator:
                         ValidationIssue(
                             code=ErrorCode.MISSING_COLUMN,
                             severity="error",
-                            message=f"Missing column for required field {f.name!r}",
-                            field_name=f.name,
+                            message=f"missing column for required field {_q(column.name)}",
+                            field_name=column.name,
                         )
                     ):
                         return False
@@ -279,57 +363,84 @@ class _Validator:
                     ValidationIssue(
                         code=ErrorCode.EXTRA_COLUMN,
                         severity=severity,
-                        message=f"Column {header!r} does not match any field",
+                        message=f"column {_q(header)} does not match any field",
                         column=header,
                     )
                 ):
                     return False
 
-        for header, f in self._header_to_field.items():
+        for header, column in self._header_to_field.items():
             unit_str = self._header_unit.get(header)
+            canonical = self._header_canonical.get(header)
 
             if self._header_ambiguous.get(header, False):
                 if not self._add_issue(
                     ValidationIssue(
                         code=ErrorCode.UNIT_AMBIGUOUS,
                         severity="warning",
-                        message=f"Column {header!r}: unit 'C' interpreted as Celsius (ambiguous with coulomb)",
+                        message=(
+                            f"column {_q(header)}: unit {_q(unit_str or 'C')} "
+                            "interpreted as degrees Celsius (ambiguous with coulomb)"
+                        ),
                         column=header,
-                        field_name=f.name,
+                        field_name=column.name,
                     )
                 ):
                     return False
 
-            if unit_str is not None:
-                if f.unit is None:
-                    if not self._add_issue(
-                        ValidationIssue(
-                            code=ErrorCode.UNIT_UNEXPECTED,
-                            severity="warning",
-                            message=f"Column {header!r} has unit {unit_str!r} but field {f.name!r} has no declared unit",
-                            column=header,
-                            field_name=f.name,
-                            context={"header_unit": unit_str},
-                        )
-                    ):
-                        return False
-                else:
-                    field_unit = f.unit_string or str(f.unit)
-                    if not are_units_compatible(unit_str, field_unit):
-                        if not self._add_issue(
-                            ValidationIssue(
-                                code=ErrorCode.UNIT_INCOMPATIBLE,
-                                severity="error",
-                                message=(
-                                    f"Column {header!r}: unit {unit_str!r} is incompatible "
-                                    f"with field unit {field_unit!r}"
-                                ),
-                                column=header,
-                                field_name=f.name,
-                                context={"header_unit": unit_str, "field_unit": field_unit},
-                            )
-                        ):
-                            return False
+            if unit_str is None:
+                continue
+
+            if canonical is None:
+                self._skipped_fields.add(column.name)
+                if not self._add_issue(
+                    ValidationIssue(
+                        code=ErrorCode.UNIT_UNKNOWN,
+                        severity="error",
+                        message=f"column {_q(header)}: unit {_q(unit_str)} is not a known unit",
+                        column=header,
+                        field_name=column.name,
+                        context={"header_unit": unit_str},
+                    )
+                ):
+                    return False
+                continue
+
+            if column.unit is None:
+                if not self._add_issue(
+                    ValidationIssue(
+                        code=ErrorCode.UNIT_UNEXPECTED,
+                        severity="warning",
+                        message=(
+                            f"column {_q(header)}: unit {_q(unit_str)} "
+                            f"is not declared on field {_q(column.name)}"
+                        ),
+                        column=header,
+                        field_name=column.name,
+                        context={"header_unit": unit_str},
+                    )
+                ):
+                    return False
+                continue
+
+            field_unit = column.unit_string or str(column.unit)
+            if not are_units_compatible(canonical, field_unit):
+                self._skipped_fields.add(column.name)
+                shown = format_unit(field_unit) or field_unit
+                if not self._add_issue(
+                    ValidationIssue(
+                        code=ErrorCode.UNIT_INCOMPATIBLE,
+                        severity="error",
+                        message=(
+                            f"column {_q(header)}: unit {_q(unit_str)} "
+                            f"is incompatible with field unit {_q(shown)}"
+                        ),
+                        column=header,
+                        field_name=column.name,
+                        context={"header_unit": unit_str, "field_unit": field_unit},
+                    )
+                ):
+                    return False
 
         return True
 
@@ -351,7 +462,9 @@ class _Validator:
                 ValidationIssue(
                     code=ErrorCode.ROW_LENGTH_MISMATCH,
                     severity="error",
-                    message=f"line {line_number}: expected {len(headers)} columns, got {len(row)}",
+                    message=(
+                        f"line {line_number}: expected {len(headers)} columns, got {len(row)}"
+                    ),
                     row=line_number,
                     context={"expected": len(headers), "actual": len(row)},
                 )
@@ -362,42 +475,84 @@ class _Validator:
         record: dict[str, Any] = {}
         row_has_error = False
 
-        for f in self.schema.fields:
+        for column in self.schema.fields:
+            if column.name in self._skipped_fields:
+                continue
+
             header: str | None = None
-            raw_value: str = ""
-            for h in headers:
-                if h in self._header_to_field and self._header_to_field[h].name == f.name:
-                    header = h
-                    idx = headers.index(h)
-                    raw_value = row[idx]
+            raw_value = ""
+            for candidate in headers:
+                mapped = self._header_to_field.get(candidate)
+                if mapped is not None and mapped.name == column.name:
+                    header = candidate
+                    raw_value = row[headers.index(candidate)]
                     break
 
             if header is None:
-                if f.has_default:
-                    record[f.name] = f.default
-                elif f.nullable:
-                    record[f.name] = None
+                if column.has_default:
+                    record[column.name] = column.default
+                elif column.nullable:
+                    record[column.name] = None
                 continue
 
-            value, issue = self._validate_cell(f, header, raw_value, line_number)
+            value, issue = self._validate_cell(column, header, raw_value, line_number)
 
             if issue is not None:
                 row_has_error = True
                 if not self._add_issue(issue):
                     return False
             else:
-                record[f.name] = value
+                record[column.name] = value
 
-        if not row_has_error and self.schema.primary_key:
-            pk_tuple = tuple(record.get(k) for k in self.schema.primary_key)
+        if not row_has_error and not self._skipped_fields:
+            try:
+                self._adapter.validate_python(record)
+            except ValidationError as exc:
+                row_has_error = True
+                err = exc.errors()[0]
+                loc = err.get("loc") or ()
+                fname = str(loc[0]) if loc else None
+                header_name = self._field_header.get(fname or "", fname or "")
+                if not self._add_issue(
+                    ValidationIssue(
+                        code=ErrorCode.TYPE_ERROR,
+                        severity="error",
+                        message=(
+                            f"line {line_number}, column {_q(header_name)}: "
+                            f"value is not a valid {err.get('type', 'value')}"
+                        ),
+                        row=line_number,
+                        column=header_name or None,
+                        field_name=fname,
+                        context={"error": err.get("msg", "")},
+                    )
+                ):
+                    return False
+
+        pk_blocked = any(name in self._skipped_fields for name in self.schema.primary_key)
+        if not row_has_error and self.schema.primary_key and not pk_blocked:
+            pk_tuple = tuple(record.get(key) for key in self.schema.primary_key)
             if pk_tuple in self._seen_primary_keys:
                 first_line = self._seen_primary_keys[pk_tuple]
-                pk_str = ", ".join(f"{k}={record.get(k)!r}" for k in self.schema.primary_key)
+                if len(self.schema.primary_key) == 1:
+                    key_name = self.schema.primary_key[0]
+                    message = (
+                        f"line {line_number}: {key_name} {_q(str(record.get(key_name)))} "
+                        f"already appears on line {first_line}"
+                    )
+                else:
+                    parts = ", ".join(
+                        f"{key} {_q(str(record.get(key)))}" for key in self.schema.primary_key
+                    )
+                    message = (
+                        f"line {line_number}: primary key ({parts}) "
+                        f"already appears on line {first_line}"
+                    )
                 if not self._add_issue(
                     ValidationIssue(
                         code=ErrorCode.DUPLICATE_PRIMARY_KEY,
                         severity="error",
-                        message=f"line {line_number}: duplicate primary key ({pk_str}) first seen on line {first_line}",
+                        message=message,
                         row=line_number,
                         context={
                             "first_row": first_line,
@@ -418,7 +573,7 @@ class _Validator:
 
     def _validate_cell(
         self,
-        f: Field,
+        column: Field,
         header: str,
         raw_value: str,
         line_number: int,
@@ -429,38 +584,70 @@ class _Validator:
             (value, issue) where issue is None if valid.
         """
         display_value = raw_value[:80] if len(raw_value) > 80 else raw_value
+        stripped = raw_value.strip()
 
-        if raw_value.strip() in self.na_values:
-            if f.has_default:
-                return f.default, None
-            elif f.nullable:
+        if stripped in self.na_values:
+            if column.has_default:
+                return column.default, None
+            if column.nullable:
                 return None, None
-            else:
-                return None, ValidationIssue(
-                    code=ErrorCode.NULL_NOT_ALLOWED,
-                    severity="error",
-                    message=f"line {line_number}, column {header!r}: null value not allowed",
-                    row=line_number,
-                    column=header,
-                    field_name=f.name,
-                    value=display_value,
-                )
+            return None, ValidationIssue(
+                code=ErrorCode.NULL_NOT_ALLOWED,
+                severity="error",
+                message=f"line {line_number}, column {_q(header)}: null value not allowed",
+                row=line_number,
+                column=header,
+                field_name=column.name,
+                value=display_value,
+            )
 
-        value, coerce_issue = self._coerce_value(f, header, raw_value, line_number)
+        value, coerce_issue = self._coerce_value(column, header, raw_value, line_number)
         if coerce_issue is not None:
             return None, coerce_issue
 
-        if f.dtype in (int, float) and f.unit is not None:
-            header_unit = self._header_unit.get(header)
-            if header_unit is not None:
-                field_unit = f.unit_string or str(f.unit)
-                if are_units_compatible(header_unit, field_unit):
+        if column.dtype in (int, float) and column.unit is not None:
+            canonical = self._header_canonical.get(header)
+            if canonical is not None:
+                field_unit = column.unit_string or str(column.unit)
+                if are_units_compatible(canonical, field_unit):
                     try:
-                        value = convert_value(value, header_unit, field_unit)
-                    except Exception:
-                        pass
+                        value = convert_value(value, canonical, field_unit)
+                    except Exception as exc:
+                        return None, ValidationIssue(
+                            code=ErrorCode.TYPE_ERROR,
+                            severity="error",
+                            message=(
+                                f"line {line_number}, column {_q(header)}: "
+                                f"value {_q(display_value)} could not be converted to "
+                                f"{format_unit(field_unit) or field_unit}"
+                            ),
+                            row=line_number,
+                            column=header,
+                            field_name=column.name,
+                            value=display_value,
+                            context={"error": str(exc)},
+                        )
+                    if column.dtype is int and isinstance(value, float):
+                        if math.isfinite(value) and value.is_integer():
+                            value = int(value)
+                        else:
+                            return None, ValidationIssue(
+                                code=ErrorCode.TYPE_ERROR,
+                                severity="error",
+                                message=(
+                                    f"line {line_number}, column {_q(header)}: "
+                                    f"value {_q(display_value)} is not a valid int"
+                                ),
+                                row=line_number,
+                                column=header,
+                                field_name=column.name,
+                                value=display_value,
+                                context={"dtype": "int"},
+                            )
 
-        constraint_issue = self._check_constraints(f, header, value, raw_value, line_number)
+        value, constraint_issue = self._check_constraints(
+            column, header, value, raw_value, line_number
+        )
         if constraint_issue is not None:
             return None, constraint_issue
 
@@ -468,161 +655,192 @@ class _Validator:
 
     def _coerce_value(
         self,
-        f: Field,
+        column: Field,
         header: str,
         raw_value: str,
         line_number: int,
     ) -> tuple[Any, ValidationIssue | None]:
         """Coerce a raw string value to the field's dtype."""
         display_value = raw_value[:80] if len(raw_value) > 80 else raw_value
-        value = raw_value.strip()
+        value = raw_value.strip() if self.strip else raw_value
 
-        if self.thousands and f.dtype in (int, float):
+        if self.thousands and column.dtype in (int, float):
             value = value.replace(self.thousands, "")
 
-        if self.decimal != "." and f.dtype in (int, float):
+        if self.decimal != "." and column.dtype in (int, float):
             value = value.replace(self.decimal, ".")
 
         try:
-            if f.dtype is int:
-                if "." in value:
-                    float_val = float(value)
-                    if float_val != int(float_val):
-                        raise ValueError("Not an integer")
-                    return int(float_val), None
-                return int(value), None
+            if column.dtype is int:
+                if _INT_LITERAL.fullmatch(value):
+                    return int(value), None
+                float_val = float(value)
+                if not math.isfinite(float_val) or not float_val.is_integer():
+                    raise ValueError("Not an integer")
+                return int(float_val), None
 
-            elif f.dtype is float:
+            if column.dtype is float:
                 return float(value), None
 
-            elif f.dtype is bool:
+            if column.dtype is bool:
                 lower = value.lower()
                 if lower in _BOOL_TRUE:
                     return True, None
-                elif lower in _BOOL_FALSE:
+                if lower in _BOOL_FALSE:
                     return False, None
                 raise ValueError(f"Not a valid boolean: {value}")
 
-            else:
-                return value, None
+            return value, None
 
-        except (ValueError, TypeError) as e:
+        except (ValueError, TypeError, OverflowError) as exc:
             return None, ValidationIssue(
                 code=ErrorCode.TYPE_ERROR,
                 severity="error",
-                message=f"line {line_number}, column {header!r}: value {display_value!r} is not a valid {f.dtype.__name__}",
+                message=(
+                    f"line {line_number}, column {_q(header)}: "
+                    f"value {_q(display_value)} is not a valid {column.dtype.__name__}"
+                ),
                 row=line_number,
                 column=header,
-                field_name=f.name,
+                field_name=column.name,
                 value=display_value,
-                context={"dtype": f.dtype.__name__, "error": str(e)},
+                context={"dtype": column.dtype.__name__, "error": str(exc)},
             )
 
     def _check_constraints(
         self,
-        f: Field,
+        column: Field,
         header: str,
         value: Any,
         raw_value: str,
         line_number: int,
-    ) -> ValidationIssue | None:
-        """Check field constraints on a coerced value."""
+    ) -> tuple[Any, ValidationIssue | None]:
+        """Check field constraints on a coerced value.
+
+        Custom validators may replace ``value``. The returned value is the one
+        that should be stored when there is no issue.
+        """
         display_value = raw_value[:80] if len(raw_value) > 80 else raw_value
+        shown_unit = format_unit(column.unit_string)
+        unit_suffix = f" {shown_unit}" if shown_unit else ""
+        unit_context = {"unit": shown_unit} if shown_unit else {}
 
-        if f.dtype in (int, float):
-            unit_str = f.unit_string or ""
-            unit_suffix = f" {unit_str}" if unit_str else ""
-
-            if f.ge is not None and value < f.ge:
-                return ValidationIssue(
+        if column.dtype in (int, float):
+            if column.ge is not None and value < column.ge:
+                return value, ValidationIssue(
                     code=ErrorCode.LESS_THAN_MINIMUM,
                     severity="error",
-                    message=f"line {line_number}, column {header!r}: value {value} is less than minimum {f.ge}{unit_suffix}",
+                    message=(
+                        f"line {line_number}, column {_q(header)}: "
+                        f"value {_format_number(value)} is less than minimum "
+                        f"{_format_number(column.ge)}{unit_suffix}"
+                    ),
                     row=line_number,
                     column=header,
-                    field_name=f.name,
+                    field_name=column.name,
                     value=display_value,
-                    context={"ge": f.ge, "unit": unit_str} if unit_str else {"ge": f.ge},
+                    context={"ge": column.ge, **unit_context},
                 )
 
-            if f.gt is not None and value <= f.gt:
-                return ValidationIssue(
+            if column.gt is not None and value <= column.gt:
+                return value, ValidationIssue(
                     code=ErrorCode.LESS_THAN_MINIMUM,
                     severity="error",
-                    message=f"line {line_number}, column {header!r}: value {value} is not greater than {f.gt}{unit_suffix}",
+                    message=(
+                        f"line {line_number}, column {_q(header)}: "
+                        f"value {_format_number(value)} is not greater than "
+                        f"{_format_number(column.gt)}{unit_suffix}"
+                    ),
                     row=line_number,
                     column=header,
-                    field_name=f.name,
+                    field_name=column.name,
                     value=display_value,
-                    context={"gt": f.gt, "unit": unit_str} if unit_str else {"gt": f.gt},
+                    context={"gt": column.gt, **unit_context},
                 )
 
-            if f.le is not None and value > f.le:
-                return ValidationIssue(
+            if column.le is not None and value > column.le:
+                return value, ValidationIssue(
                     code=ErrorCode.GREATER_THAN_MAXIMUM,
                     severity="error",
-                    message=f"line {line_number}, column {header!r}: value {value} is greater than maximum {f.le}{unit_suffix}",
+                    message=(
+                        f"line {line_number}, column {_q(header)}: "
+                        f"value {_format_number(value)} is greater than maximum "
+                        f"{_format_number(column.le)}{unit_suffix}"
+                    ),
                     row=line_number,
                     column=header,
-                    field_name=f.name,
+                    field_name=column.name,
                     value=display_value,
-                    context={"le": f.le, "unit": unit_str} if unit_str else {"le": f.le},
+                    context={"le": column.le, **unit_context},
                 )
 
-            if f.lt is not None and value >= f.lt:
-                return ValidationIssue(
+            if column.lt is not None and value >= column.lt:
+                return value, ValidationIssue(
                     code=ErrorCode.GREATER_THAN_MAXIMUM,
                     severity="error",
-                    message=f"line {line_number}, column {header!r}: value {value} is not less than {f.lt}{unit_suffix}",
+                    message=(
+                        f"line {line_number}, column {_q(header)}: "
+                        f"value {_format_number(value)} is not less than "
+                        f"{_format_number(column.lt)}{unit_suffix}"
+                    ),
                     row=line_number,
                     column=header,
-                    field_name=f.name,
+                    field_name=column.name,
                     value=display_value,
-                    context={"lt": f.lt, "unit": unit_str} if unit_str else {"lt": f.lt},
+                    context={"lt": column.lt, **unit_context},
                 )
 
-        if f.enum is not None and value not in f.enum:
-            return ValidationIssue(
+        if column.enum is not None and value not in column.enum:
+            return value, ValidationIssue(
                 code=ErrorCode.NOT_IN_ENUM,
                 severity="error",
-                message=f"line {line_number}, column {header!r}: value {display_value!r} is not in allowed values",
+                message=(
+                    f"line {line_number}, column {_q(header)}: "
+                    f"value {_q(display_value)} is not in allowed values"
+                ),
                 row=line_number,
                 column=header,
-                field_name=f.name,
+                field_name=column.name,
                 value=display_value,
-                context={"enum": list(f.enum)},
+                context={"enum": list(column.enum)},
             )
 
-        if f.pattern is not None and f.dtype is str:
-            if not re.fullmatch(f.pattern, value):
-                return ValidationIssue(
+        if column.pattern is not None and column.dtype is str:
+            if not re.fullmatch(column.pattern, value):
+                return value, ValidationIssue(
                     code=ErrorCode.PATTERN_MISMATCH,
                     severity="error",
-                    message=f"line {line_number}, column {header!r}: value {display_value!r} does not match pattern {f.pattern!r}",
+                    message=(
+                        f"line {line_number}, column {_q(header)}: "
+                        f"value {_q(display_value)} does not match pattern {_q(column.pattern)}"
+                    ),
                     row=line_number,
                     column=header,
-                    field_name=f.name,
+                    field_name=column.name,
                     value=display_value,
-                    context={"pattern": f.pattern},
+                    context={"pattern": column.pattern},
                 )
 
-        for validator in f.validators:
+        for validator in column.validators:
             try:
                 value = validator(value)
-            except ValueError as e:
+            except ValueError as exc:
                 validator_name = getattr(validator, "__name__", repr(validator))
-                return ValidationIssue(
+                return value, ValidationIssue(
                     code=ErrorCode.CUSTOM_VALIDATOR,
                     severity="error",
-                    message=f"line {line_number}, column {header!r}: custom validator {validator_name} rejected value: {e}",
+                    message=(
+                        f"line {line_number}, column {_q(header)}: "
+                        f"custom validator {validator_name} rejected value: {exc}"
+                    ),
                     row=line_number,
                     column=header,
-                    field_name=f.name,
+                    field_name=column.name,
                     value=display_value,
-                    context={"validator": validator_name, "error": str(e)},
+                    context={"validator": validator_name, "error": str(exc)},
                 )
 
-        return None
+        return value, None
 
     def get_result(self) -> ValidationResult:
         """Get the final validation result."""
@@ -661,7 +879,9 @@ def validate_rows(
     validator.validate_headers(headers)
 
     for line_number, row_dict in enumerate(rows, start=2):
-        row_values = [str(row_dict.get(h, "")) for h in headers]
+        row_values = [
+            "" if row_dict.get(header) is None else str(row_dict.get(header)) for header in headers
+        ]
         if not validator.validate_row(row_values, headers, line_number):
             break
 

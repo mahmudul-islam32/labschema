@@ -16,6 +16,12 @@ from labschema.io import read_csv
 from labschema.schema import TableSchema
 
 
+def _count(amount: int, singular: str) -> str:
+    """Format a count with a singular or plural noun."""
+    noun = singular if amount == 1 else f"{singular}s"
+    return f"{amount} {noun}"
+
+
 def _load_schema(schema_path: str) -> TableSchema:
     """Load a schema from a file path or Python import path.
 
@@ -97,10 +103,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
         error_count = len(result.report.errors)
         warning_count = len(result.report.warnings)
         print(
-            f"{args.data}: {result.total_rows} rows, "
+            f"{args.data}: {_count(result.total_rows, 'row')}, "
             f"{result.valid_rows} valid, "
-            f"{error_count} errors, "
-            f"{warning_count} warnings"
+            f"{_count(error_count, 'error')}, "
+            f"{_count(warning_count, 'warning')}"
         )
 
         if result.report.issues:

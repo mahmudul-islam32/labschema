@@ -82,7 +82,7 @@ jobs:
 
             ## What's Changed
 
-            See [CHANGELOG.md](https://github.com/labschema/labschema/blob/v${{ steps.version.outputs.VERSION }}/CHANGELOG.md) for details.
+            See [CHANGELOG.md](https://github.com/mahmudul-islam32/labschema/blob/v${{ steps.version.outputs.VERSION }}/CHANGELOG.md) for details.
           files: dist/*
           draft: false
           prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}

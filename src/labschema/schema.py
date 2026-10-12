@@ -248,39 +248,64 @@ class TableSchema:
     def to_base_units(self) -> TableSchema:
         """Return a new schema with all units converted to SI base units.
 
+        Numeric bounds, defaults, and enum values are converted with the unit
+        so they stay expressed in the field's declared unit.
+
         Returns:
             A new TableSchema with SI base units.
         """
+        from labschema.units import convert_value, get_registry, parse_unit
+
+        reg = get_registry()
         new_fields = []
 
         for f in self.fields:
-            if f.unit is not None:
-                from labschema.units import get_registry, parse_unit
-
-                reg = get_registry()
-                unit = parse_unit(f.unit if isinstance(f.unit, str) else str(f.unit))
-                quantity = reg.Quantity(1, unit)
-                base_unit = quantity.to_base_units().units
-                new_fields.append(
-                    Field(
-                        name=f.name,
-                        dtype=f.dtype,
-                        unit=str(base_unit),
-                        nullable=f.nullable,
-                        description=f.description,
-                        aliases=f.aliases,
-                        ge=f.ge,
-                        gt=f.gt,
-                        le=f.le,
-                        lt=f.lt,
-                        enum=f.enum,
-                        pattern=f.pattern,
-                        validators=f.validators,
-                        default=f.default if f.has_default else f.default,
-                    )
-                )
-            else:
+            if f.unit is None:
                 new_fields.append(f)
+                continue
+
+            unit = parse_unit(f.unit if isinstance(f.unit, str) else str(f.unit))
+            base_unit = reg.Quantity(1, unit).to_base_units().units
+            source = str(unit)
+            target = str(base_unit)
+
+            def _convert(value: float | None, src: str = source, dst: str = target) -> float | None:
+                if value is None:
+                    return None
+                return convert_value(value, src, dst)
+
+            enum = f.enum
+            if enum is not None:
+                converted_enum: list[Any] = []
+                for item in enum:
+                    if isinstance(item, bool) or not isinstance(item, (int, float)):
+                        converted_enum.append(item)
+                    else:
+                        converted_enum.append(_convert(float(item)))
+                enum = converted_enum
+
+            kwargs: dict[str, Any] = {
+                "name": f.name,
+                "dtype": f.dtype,
+                "unit": target,
+                "nullable": f.nullable,
+                "description": f.description,
+                "aliases": f.aliases,
+                "ge": _convert(f.ge),
+                "gt": _convert(f.gt),
+                "le": _convert(f.le),
+                "lt": _convert(f.lt),
+                "enum": enum,
+                "pattern": f.pattern,
+                "validators": f.validators,
+            }
+            if f.has_default:
+                default = f.default
+                if isinstance(default, bool) or not isinstance(default, (int, float)):
+                    kwargs["default"] = default
+                else:
+                    kwargs["default"] = _convert(float(default))
+            new_fields.append(Field(**kwargs))
 
         return TableSchema(
             name=self.name,

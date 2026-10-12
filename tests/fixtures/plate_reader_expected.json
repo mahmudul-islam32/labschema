@@ -3,6 +3,7 @@
   "valid_rows": 6,
   "expected_errors": [
     {"code": "type_error", "row": 6, "column": "absorbance"},
+    {"code": "null_not_allowed", "row": 8, "column": "absorbance"},
     {"code": "less_than_minimum", "row": 9, "column": "temperature (°C)"},
     {"code": "duplicate_primary_key", "row": 11}
   ]
