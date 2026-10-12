@@ -1,8 +1,8 @@
 # LabSchema
 
-[![CI](https://github.com/labschema/labschema/workflows/CI/badge.svg)](https://github.com/labschema/labschema/actions)
-[![PyPI version](https://badge.fury.io/py/labschema.svg)](https://badge.fury.io/py/labschema)
-[![Python Versions](https://img.shields.io/pypi/pyversions/labschema.svg)](https://pypi.org/project/labschema/)
+[![CI](https://github.com/mahmudul-islam32/labschema/actions/workflows/ci.yml/badge.svg)](https://github.com/mahmudul-islam32/labschema/actions/workflows/ci.yml)
+[![PyPI version](https://img.shields.io/pypi/v/labschema.svg)](https://pypi.org/project/labschema/)
+[![Python versions](https://img.shields.io/pypi/pyversions/labschema.svg)](https://pypi.org/project/labschema/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **LabSchema** is a Python library that turns messy lab-style tables (CSV, TSV) into **typed schemas with physical units and validation**.
@@ -15,6 +15,8 @@
 - **Schema inference** — Generate draft schemas from your data files
 - **Multiple exports** — Export schemas as JSON or JSON Schema (draft 2020-12)
 - **CLI included** — Validate files, infer schemas, and export from the command line
+
+The full contract is in [docs/SPEC.md](docs/SPEC.md).
 
 ## Installation
 
@@ -93,6 +95,10 @@ labschema infer data.csv --name my_schema -o schema.json
 labschema export-schema schema.json --format jsonschema -o schema.jsonschema
 ```
 
+`--schema` accepts a LabSchema JSON file or a Python import path such as `myproj.schemas:plate_run`. An import path loads and executes that module; only point it at code you trust.
+
+Exit codes: `0` when the data is valid (warnings are allowed unless `--strict`), `1` when validation finds errors, `2` for usage errors, unreadable files, or an invalid schema.
+
 ### Options
 
 ```bash
@@ -120,8 +126,8 @@ Field("notes", str, nullable=True)
 # Field with enum constraint
 Field("status", str, enum=["active", "inactive", "pending"])
 
-# Field with regex pattern
-Field("well", str, pattern=r"^[A-H][1-9]|1[0-2]$")
+# Field with regex pattern (full match)
+Field("well", str, pattern=r"^[A-H](?:[1-9]|1[0-2])$")
 
 # Field with default value
 Field("replicate", int, default=1)
@@ -192,6 +198,10 @@ Field("volume", float, unit="L")
 # Result: volume = 1.0 (converted to liters)
 ```
 
+Values are stored in the field's declared unit. `schema.to_base_units()` returns a copy whose units, bounds, and numeric defaults are the SI base equivalents. Offset temperatures (°C, °F) convert as absolute temperatures.
+
+Call `labschema.units.set_registry(reg)` before any other LabSchema operation to use your own Pint registry. Mixing units from two registries raises `SchemaError`.
+
 ## Validation
 
 ### Error Codes
@@ -210,6 +220,11 @@ Field("volume", float, unit="L")
 | `not_in_enum` | Value not in enum |
 | `pattern_mismatch` | String doesn't match pattern |
 | `duplicate_primary_key` | Primary key already seen |
+| `unit_unknown` | Header unit looks like a unit but cannot be parsed |
+| `unit_unexpected` | Header has a unit and the field declares none |
+| `unit_ambiguous` | Ambiguous header unit resolved by convention (`C` means °C) |
+| `custom_validator` | A custom validator raised `ValueError` |
+| `parse_error` | Malformed CSV |
 
 ### Accessing Results
 
@@ -292,7 +307,7 @@ result = read_csv(
 
 ```bash
 # Clone the repository
-git clone https://github.com/labschema/labschema.git
+git clone https://github.com/mahmudul-islam32/labschema.git
 cd labschema
 
 # Install development dependencies

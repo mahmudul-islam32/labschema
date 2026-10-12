@@ -60,11 +60,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `to_pandas()` method on ValidationResult
   - Unit metadata in DataFrame attrs
 
+### Fixed
+
+- A header unit of `C` is read as degrees Celsius (with a `unit_ambiguous` warning) and converted as an absolute temperature.
+- Header text that looks like a unit but cannot be parsed raises `unit_unknown`, and that column is skipped.
+- Custom validators may replace the cell value they accept.
+- `TableSchema.to_base_units()` converts bounds, numeric defaults, and numeric enum values into the base unit.
+- CSV and TSV reads stream rows. Comment lines and skipped preambles keep the original file line numbers.
+- `set_registry()` can install a Pint registry before the first unit operation.
+
 ### Dependencies
 
 - pydantic >= 2.5
 - pint >= 0.23
 - pandas >= 2.0 (optional)
 
-[Unreleased]: https://github.com/labschema/labschema/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/labschema/labschema/releases/tag/v0.1.0
+[Unreleased]: https://github.com/mahmudul-islam32/labschema/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/mahmudul-islam32/labschema/releases/tag/v0.1.0
